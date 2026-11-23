@@ -1,18 +1,144 @@
 import re
 import time
+import math
+import asyncio
 import hashlib
 import secrets
 import sqlite3
+import logging
+from html import escape
+from pathlib import Path
 from decimal import Decimal, InvalidOperation
+from contextlib import suppress
+from urllib.parse import urlencode
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.types import (CallbackQuery, InlineKeyboardButton as Button,
+    InlineKeyboardMarkup as Keyboard, Message, LinkPreviewOptions, InlineQuery,
+    InlineQueryResultArticle, InlineQueryResultsButton, InputTextMessageContent,
+    ChosenInlineResult, BusinessConnection, MessageEntity)
+from aiogram.exceptions import TelegramBadRequest, TelegramAPIError, TelegramRetryAfter
+
+# ═══════════════════════════════════════════════════════════════
+#  ТОКЕН БОТА — впиши сюда токен от @BotFather (без пробелов/кавычек)
+#  Получить: https://t.me/BotFather → /newbot или выбери бота → API Token
+# ═══════════════════════════════════════════════════════════════
+BOT_TOKEN = '9067892123:AAHDLCg00dCgEEbmXOncx7uS1U-LR4OrENI'
+# ═══════════════════════════════════════════════════════════════
+
+ROOT = Path(__file__).resolve().parent
+
+# ═══════════════════════════════════════════════════════════════
+#  Тексты карточки и алертов — RU / EN
+#  Язык оффера: 'ru' (по умолчанию) или 'en' (если в конце 'eng')
+# ═══════════════════════════════════════════════════════════════
+T = {
+    'ru': {
+        'tpl_expired':    '🎁 {name} #{number}\n\nСрок действия офера истёк.\n\n🆔 <b>ID сделки:</b> <code>{did}</code>',
+        'tpl_new':        'Пользователь {buyer} предлαгαет Вαм {price} зα коллекционный предмет\n<a href="{url}">{name}</a>\n\nДействует {h}ч {m}мин...\n\n🆔 <b>ID сделки:</b> <code>{did}</code>',
+        'tpl_accepted':   '🎁 {name} #{number}  успешно\nпродαн!\n\n• Передαйте подαрок покупαтелю для\nзαчисления {price}.\n\n🆔 <b>ID сделки:</b> <code>{did}</code>',
+        'tpl_pending':    '🎁 {name} #{number}\n\n⏳ Оплата ожидается.\n\n🆔 <b>ID сделки:</b> <code>{did}</code>',
+        'tpl_paid':       '🎁 {name} #{number}\n\n✅ Оплата подтверждена.\n\n🆔 <b>ID сделки:</b> <code>{did}</code>',
+        'tpl_declined':   '🎁 {name} #{number}\n\nПредложение отклонено.\n\n🆔 <b>ID сделки:</b> <code>{did}</code>',
+        'btn_decline':    '❌ Отклонить',
+        'btn_accept':     '✅ Принять',
+        'btn_transfer':   'Передαть подαрок',
+        'btn_paid':       'Я получил оплату',
+        'btn_confirm_yes':'Да, оплата получена',
+        'btn_back':       'Назад',
+        'alert_accept':        '🎁 {name} #{number} успешно продαн!\n\nПередαйте подαрок покупαтелю для зαчисления {price}.',
+        'alert_not_accepted':  'Сначала примите предложение или откройте его актуальную карточку.',
+        'alert_confirm_paid':  'Подтвердите, только если вы действительно получили оплату.',
+        'alert_status_changed':'Статус уже изменился. Откройте предложение по исходной ссылке.',
+        'alert_private_only':  'Откройте предложение в личном чате с ботом.',
+        'alert_biz_unavailable':'Бизнес-подключение недоступно.',
+        'err_not_found':     'Офер не найден. Попросите автора создать новый.',
+        'err_wrong_seller':  'Офер привязан к другому аккаунту продавца. Откройте его с аккаунта, для которого он создан.',
+        'err_wrong_target':  'Офер создан для @{target}. Вы вошли как {current}. Проверьте username продавца в запросе.',
+        'err_unavailable':   'Офер недоступен для вашего аккаунта.',
+        'no_username':       'аккаунт без username',
+    },
+    'en': {
+        'tpl_expired':    '🎁 {name} #{number}\n\nThe offer has expired.\n\n🆔 <b>Deal ID:</b> <code>{did}</code>',
+        'tpl_new':        'User {buyer} offers you {price} for a collectible item\n<a href="{url}">{name}</a>\n\nValid for {h}h {m}m...\n\n🆔 <b>Deal ID:</b> <code>{did}</code>',
+        'tpl_accepted':   '🎁 {name} #{number} successfully\nsold!\n\n• Send the gift to the buyer to\ncredit {price}.\n\n🆔 <b>Deal ID:</b> <code>{did}</code>',
+        'tpl_pending':    '🎁 {name} #{number}\n\n⏳ Awaiting payment.\n\n🆔 <b>Deal ID:</b> <code>{did}</code>',
+        'tpl_paid':       '🎁 {name} #{number}\n\n✅ Payment confirmed.\n\n🆔 <b>Deal ID:</b> <code>{did}</code>',
+        'tpl_declined':   '🎁 {name} #{number}\n\nOffer declined.\n\n🆔 <b>Deal ID:</b> <code>{did}</code>',
+        'btn_decline':    '❌ Decline',
+        'btn_accept':     '✅ Accept',
+        'btn_transfer':   'Send gift',
+        'btn_paid':       'I received payment',
+        'btn_confirm_yes':'Yes, payment received',
+        'btn_back':       'Back',
+        'alert_accept':        '🎁 {name} #{number} successfully sold!\n\nSend the gift to the buyer to credit {price}.',
+        'alert_not_accepted':  'Accept the offer first or open its current card.',
+        'alert_confirm_paid':  'Confirm only if you have actually received payment.',
+        'alert_status_changed':'Status has already changed. Open the offer via the original link.',
+        'alert_private_only':  'Open the offer in a private chat with the bot.',
+        'alert_biz_unavailable':'Business connection unavailable.',
+        'err_not_found':     'Offer not found. Ask the author to create a new one.',
+        'err_wrong_seller':  'The offer is linked to another seller account. Open it from the account it was created for.',
+        'err_wrong_target':  'The offer was created for @{target}. You are signed in as {current}. Check the seller username.',
+        'err_unavailable':   'The offer is not available for your account.',
+        'no_username':       'account without username',
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  Подробная инструкция (показывается по /help и /start setup)
+# ═══════════════════════════════════════════════════════════════
+GUIDE = (
+    '📖 <b>Инструкция по созданию оферов</b>\n\n'
+    '<b>1️⃣ Включите inline-режим</b> (если ещё не включён):\n'
+    '• Откройте @BotFather → отправьте /setinline\n'
+    '• Выберите своего бота\n'
+    '• Введите короткое название (например: <code>Поиск оферов</code>)\n'
+    '• Подождите 1–2 минуты\n\n'
+    '<b>2️⃣ Активируйте доступ</b>:\n'
+    '• Отправьте /work → нажмите кнопку «Оставить заявку inline»\n\n'
+    '<b>3️⃣ Создайте офер</b>\n\n'
+    'Через команду /offer в личке бота:\n'
+    '<code>/offer @продавец https://t.me/nft/PlushPepe-2687 20</code>\n'
+    '<code>/offer https://t.me/nft/PlushPepe-2687 20</code>\n\n'
+    'Через inline-режим (в любом чате):\n'
+    '<code>@бот @продавец https://t.me/nft/PlushPepe-2687 20</code>\n'
+    '<code>@бот https://t.me/nft/PlushPepe-2687 20</code>\n\n'
+    'В бизнес-чате (Secretary Mode):\n'
+    '<code>/offer @продавец https://t.me/nft/PlushPepe-2687 20</code>\n'
+    '<code>/o https://t.me/nft/PlushPepe-2687 20</code> — короткая команда\n\n'
+    '<b>4️⃣ Валюта</b> (по умолчанию <code>stars</code>):\n'
+    '<code>/offer URL цена stars</code> — Telegram Stars ⭐️\n'
+    '<code>/offer URL цена gram</code> — TON\n\n'
+    '<b>5️⃣ Язык</b> (по умолчанию русский):\n'
+    '<code>/offer URL цена eng</code> — карточка на английском\n'
+    '<code>/offer URL цена stars eng</code> — Stars + английский\n\n'
+    '<b>Полный формат:</b>\n'
+    '<code>[@продавец] URL цена [stars/gram] [eng]</code>'
+)
+
+
+def offer_lang(o):
+    """Возвращает язык оффера: 'ru' или 'en'."""
+    if o and 'lang' in o.keys() and o['lang']:
+        return o['lang']
+    return 'ru'
 
 
 def parse_offer(args):
     parts = (args or '').split()
     if not parts:
-        raise ValueError('Формат: @продавец URL цена [stars/gram]  или  URL цена [stars/gram]')
+        raise ValueError('Формат: [@продавец] URL цена [stars/gram] [eng]')
+    # Языковой суффикс: eng / en (всегда последний)
+    lang = 'ru'
+    if parts[-1].lower() in ('eng', 'en'):
+        parts.pop()
+        lang = 'en'
     # Необязательный суффикс валюты: stars / gram / ton
     currency = 'XTR'
-    if parts[-1].lower() in ('stars', 'star', 'gram', 'ton'):
+    if parts and parts[-1].lower() in ('stars', 'star', 'gram', 'ton'):
         suffix = parts.pop().lower()
         currency = 'TON' if suffix in ('gram', 'ton') else 'XTR'
     # Необязательный префикс @продавец
@@ -33,7 +159,7 @@ def parse_offer(args):
             raise ValueError()
     except (InvalidOperation, ValueError):
         raise ValueError('Укажите целое положительное количество.')
-    return target, url, str(int(value)), currency
+    return target, url, str(int(value)), currency, lang
 
 
 class Store:
@@ -48,7 +174,7 @@ class Store:
         columns = {r[1] for r in self.db.execute('PRAGMA table_info(offers)')}
         for name, definition in [('currency', "TEXT NOT NULL DEFAULT 'TON'"),
                                  ('expires', 'REAL'), ('sent_at', 'REAL'), ('recipient', 'TEXT'),
-                                 ('deal_id', 'TEXT')]:
+                                 ('deal_id', 'TEXT'), ('lang', "TEXT NOT NULL DEFAULT 'ru'")]:
             if name not in columns:
                 self.db.execute(f'ALTER TABLE offers ADD COLUMN {name} {definition}')
         self.db.execute('CREATE TABLE IF NOT EXISTS inline_messages (message_id TEXT PRIMARY KEY, offer_id TEXT NOT NULL)')
@@ -100,23 +226,23 @@ class Store:
         self.set_setting(f'creator:{uid}', 'enabled')
         return True
 
-    def inline_offer(self, buyer, username, target, url, amount, currency='XTR', recipient=None):
+    def inline_offer(self, buyer, username, target, url, amount, currency='XTR', recipient=None, lang='ru'):
         # Telegram sends queries repeatedly while typing; reuse the same offer.
-        fingerprint = hashlib.sha256(f'{currency}|{buyer}|{username}|{target or ""}|{url}|{amount}|{recipient or username}'.encode()).hexdigest()
+        fingerprint = hashlib.sha256(f'{currency}|{buyer}|{username}|{target or ""}|{url}|{amount}|{recipient or username}|{lang}'.encode()).hexdigest()
         row = self.db.execute('SELECT offer_id FROM inline_offers WHERE fingerprint=?', (fingerprint,)).fetchone()
         if row:
             return self.get(row[0])
-        key = self.create(buyer, username, target, url, amount, currency=currency, recipient=recipient)
+        key = self.create(buyer, username, target, url, amount, currency=currency, recipient=recipient, lang=lang)
         with self.db:
             self.db.execute('INSERT INTO inline_offers VALUES (?,?)', (fingerprint, key))
         return self.get(key)
 
-    def create(self, buyer, username, target, url, amount, currency='XTR', recipient=None):
+    def create(self, buyer, username, target, url, amount, currency='XTR', recipient=None, lang='ru'):
         key = secrets.token_urlsafe(12)
         deal_id = secrets.token_hex(5)  # 10 hex chars, e.g. "de88ff8184"
         with self.db:
-            self.db.execute('INSERT INTO offers(id,deal_id,buyer,username,target,url,amount,currency,expires,recipient) VALUES(?,?,?,?,?,?,?,?,?,?)',
-                            (key, deal_id, buyer, username, target or '', url, amount, currency, time.time() + 21600, recipient or username))
+            self.db.execute('INSERT INTO offers(id,deal_id,buyer,username,target,url,amount,currency,expires,recipient,lang) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                            (key, deal_id, buyer, username, target or '', url, amount, currency, time.time() + 21600, recipient or username, lang))
         return key
 
     def get(self, key):
@@ -159,43 +285,20 @@ class Store:
                                    (after, uid, key, before)).rowcount == 1
 
 
-import asyncio
-import time
-import math
-from contextlib import suppress
-import logging
-import os
-from html import escape
-from pathlib import Path
-from urllib.parse import urlencode
-
-from aiogram import Bot, Dispatcher, F
-from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import CallbackQuery, InlineKeyboardButton as Button, InlineKeyboardMarkup as Keyboard, Message, LinkPreviewOptions
-from aiogram.types import InlineQuery, InlineQueryResultArticle, InlineQueryResultsButton, InputTextMessageContent, ChosenInlineResult
-from aiogram.types import BusinessConnection
-from aiogram.types import MessageEntity
-from aiogram.exceptions import TelegramBadRequest, TelegramAPIError, TelegramRetryAfter
-from dotenv import load_dotenv
-
-
-ROOT = Path(__file__).resolve().parent
-
-
 def gift_recipient(offer):
     return offer['recipient'] or offer['username']
 
 
-def access_error(offer, user):
+def access_error(offer, user, lang='ru'):
+    t = T[lang]
     if not offer:
-        return 'Офер не найден. Попросите автора создать новый.'
+        return t['err_not_found']
     if offer['seller'] is not None:
-        return 'Офер привязан к другому аккаунту продавца. Откройте его с аккаунта, для которого он создан.'
+        return t['err_wrong_seller']
     if offer['target']:
-        current = f'@{user.username}' if user.username else 'аккаунт без username'
-        return f'Офер создан для @{offer["target"]}. Вы вошли как {current}. Проверьте username продавца в запросе.'
-    return 'Офер недоступен для вашего аккаунта.'
+        current = f'@{user.username}' if user.username else t['no_username']
+        return t['err_wrong_target'].format(target=offer['target'], current=current)
+    return t['err_unavailable']
 
 
 def gift_info(o):
@@ -223,48 +326,35 @@ def render(o):
     did = deal_id(o)
     key = o['id']
     buyer = f'@{o["username"]}'
+    t = T[offer_lang(o)]
     rows = []
+    p = price(o)
 
     if o['state'] == 'new' and o['expires'] and time.time() >= o['expires']:
-        text = (f'🎁 {escape(name)} #{escape(number)}\n\n'
-                f'Срок действия офера истёк.\n\n'
-                f'🆔 <b>ID сделки:</b> <code>{did}</code>')
+        text = t['tpl_expired'].format(name=escape(name), number=escape(number), did=did)
     elif o['state'] == 'new':
         minutes = min(360, max(0, math.ceil((o['expires'] - time.time()) / 60)))
         hours, mins = minutes // 60, minutes % 60
-        text = (f'Пользователь {buyer} предлαгαет Вαм {price(o)} '
-                f'зα коллекционный предмет\n'
-                f'<a href="{o["url"]}">{escape(name)}</a>\n\n'
-                f'Действует {hours}ч {mins}мин...\n\n'
-                f'🆔 <b>ID сделки:</b> <code>{did}</code>')
+        text = t['tpl_new'].format(buyer=buyer, price=p, url=o['url'], name=escape(name),
+                                   h=hours, m=mins, did=did)
         rows += [[
-            Button(text='❌ Отклонить', callback_data=f'decline:{key}',
+            Button(text=t['btn_decline'], callback_data=f'decline:{key}',
                    text_entities=[MessageEntity(type='custom_emoji', offset=0, length=1,
                                                 custom_emoji_id='5774077015388852135')]),
-            Button(text='✅ Принять', callback_data=f'accept:{key}',
+            Button(text=t['btn_accept'], callback_data=f'accept:{key}',
                    text_entities=[MessageEntity(type='custom_emoji', offset=0, length=1,
                                                 custom_emoji_id='5774022692642492953')])
         ]]
     elif o['state'] == 'accepted':
-        text = (f'🎁 {escape(name)} #{escape(number)}  успешно\n'
-                f'продαн!\n\n'
-                f'• Передαйте подαрок покупαтелю для\n'
-                f'зαчисления {price(o)}.\n\n'
-                f'🆔 <b>ID сделки:</b> <code>{did}</code>')
-        rows += [[Button(text='Передαть подαрок', url=f'tg://send_gift?to={o["buyer"]}')]]
+        text = t['tpl_accepted'].format(name=escape(name), number=escape(number), price=p, did=did)
+        rows += [[Button(text=t['btn_transfer'], url=f'tg://send_gift?to={o["buyer"]}')]]
     elif o['state'] == 'pending':
-        text = (f'🎁 {escape(name)} #{escape(number)}\n\n'
-                f'⏳ Оплата ожидается.\n\n'
-                f'🆔 <b>ID сделки:</b> <code>{did}</code>')
-        rows += [[Button(text='Я получил оплату', callback_data=f'paid:{key}')]]
+        text = t['tpl_pending'].format(name=escape(name), number=escape(number), did=did)
+        rows += [[Button(text=t['btn_paid'], callback_data=f'paid:{key}')]]
     elif o['state'] == 'paid':
-        text = (f'🎁 {escape(name)} #{escape(number)}\n\n'
-                f'✅ Оплата подтверждена.\n\n'
-                f'🆔 <b>ID сделки:</b> <code>{did}</code>')
+        text = t['tpl_paid'].format(name=escape(name), number=escape(number), did=did)
     else:  # declined
-        text = (f'🎁 {escape(name)} #{escape(number)}\n\n'
-                f'Предложение отклонено.\n\n'
-                f'🆔 <b>ID сделки:</b> <code>{did}</code>')
+        text = t['tpl_declined'].format(name=escape(name), number=escape(number), did=did)
     return text, Keyboard(inline_keyboard=rows)
 
 
@@ -290,10 +380,12 @@ def setup(store):
             'или без указания адресата (офер уходит в текущий чат):\n'
             '<code>/offer https://t.me/nft/PlushPepe-2687 1000</code>\n'
             'В конце можно добавить валюту: <code>stars</code> или <code>gram</code> (по умолчанию stars).\n'
+            'Можно добавить <code>eng</code> для английской карточки.\n'
             'Команду должен отправить владелец бизнес-аккаунта.' if active else
             'Нет активного подключения с правом ответа. Включите Secretary Mode (бывш. Business Mode) в BotFather, '
-            'затем подключите @offersus_bot в настройках Telegram → Telegram Business → Чат-боты. '
-            'Разрешите ответы в выбранных чатах.')
+            'затем подключите бота в настройках Telegram → Telegram Business → Чат-боты. '
+            'Разрешите ответы в выбранных чатах.',
+            disable_web_page_preview=True)
 
     @dp.business_message(Command('offer', 'o'))
     async def business_offer(message: Message, command: CommandObject, bot: Bot):
@@ -313,9 +405,9 @@ def setup(store):
                 if not message.chat.username:
                     raise ValueError('Для короткой команды у продавца должен быть публичный @username.')
                 if len((args or '').split()) not in (2, 3):
-                    raise ValueError('Формат: /o https://t.me/nft/PlushPepe-2687 20 [stars/gram]')
+                    raise ValueError('Формат: /o https://t.me/nft/PlushPepe-2687 20 [stars/gram] [eng]')
                 args = f'@{message.chat.username} {args}'
-            target, url, amount, currency = parse_offer(args)
+            target, url, amount, currency, lang = parse_offer(args)
             if not connection.user.username:
                 raise ValueError('Задайте публичный @username получателя подарка.')
             if target:
@@ -331,7 +423,8 @@ def setup(store):
                 store.set_setting(f'business_error:{connection.user.id}', error.message)
                 logging.warning('Business validation reply failed: %s', error.message)
             return
-        key = store.create(connection.user.id, connection.user.username, target, url, amount, currency=currency)
+        key = store.create(connection.user.id, connection.user.username, target, url, amount,
+                           currency=currency, lang=lang)
         # Bind to the actual conversation partner before exposing the buttons.
         with store.db:
             store.db.execute('UPDATE offers SET seller=? WHERE id=?', (message.chat.id, key))
@@ -367,10 +460,11 @@ def setup(store):
                 if not offer or offer['buyer'] != query.from_user.id:
                     raise ValueError('Офер недоступен')
             else:
-                target, url, amount, currency = parse_offer(query.query)
+                target, url, amount, currency, lang = parse_offer(query.query)
                 if target and target == query.from_user.username.lower():
                     raise ValueError('Укажите @username продавца')
-                offer = store.inline_offer(query.from_user.id, query.from_user.username, target, url, amount, currency=currency)
+                offer = store.inline_offer(query.from_user.id, query.from_user.username, target, url, amount,
+                                           currency=currency, lang=lang)
         except ValueError:
             await query.answer([], cache_time=0, is_personal=True,
                                button=InlineQueryResultsButton(text='Как создать офер — инструкция', start_parameter='setup'))
@@ -390,7 +484,8 @@ def setup(store):
     async def show(message, offer):
         text, keyboard = render(offer)
         await message.answer(text, reply_markup=keyboard,
-                             link_preview_options=LinkPreviewOptions(url=offer['url'], is_disabled=False, prefer_large_media=True, show_above_text=True))
+                             link_preview_options=LinkPreviewOptions(url=offer['url'], is_disabled=False,
+                                                                     prefer_large_media=True, show_above_text=True))
 
     @dp.message(Command('work'))
     async def work(message: Message):
@@ -401,7 +496,9 @@ def setup(store):
             'Создание оферов\n\nНажмите кнопку ниже — доступ активируется автоматически.\n'
             'Получатель подарка в новых оферах — вы сами (автор офера). '
             'Оплата и передача выполняются вручную.',
-            reply_markup=Keyboard(inline_keyboard=[[Button(text='Оставить заявку inline', callback_data='work_apply')]]))
+            reply_markup=Keyboard(inline_keyboard=[
+                [Button(text='Оставить заявку inline', callback_data='work_apply')],
+                [Button(text='📖 Инструкция', callback_data='show_help')]]))
 
     @dp.message(CommandStart())
     async def start(message: Message, command: CommandObject):
@@ -410,14 +507,25 @@ def setup(store):
         if command.args and command.args != 'setup':
             offer = store.get(command.args)
             if not offer or not store.allowed(offer, message.from_user.id, message.from_user.username):
-                await message.answer(escape(access_error(offer, message.from_user)))
+                await message.answer(escape(access_error(offer, message.from_user, offer_lang(offer))))
                 return
             await show(message, offer)
+            return
+        if command.args == 'setup':
+            await message.answer(GUIDE, disable_web_page_preview=True)
             return
         await message.answer(
             '🎁 Оферы на коллекционные подарки\n\n'
             'Здесь можно получать предложения о покупке подарков в Telegram, '
-            'принимать или отклонять их и отмечать этапы сделки.')
+            'принимать или отклонять их и отмечать этапы сделки.\n\n'
+            'Отправьте /help для инструкции.',
+            reply_markup=Keyboard(inline_keyboard=[[Button(text='📖 Инструкция', callback_data='show_help')]]))
+
+    @dp.message(Command('help'))
+    async def help_cmd(message: Message):
+        if message.chat.type != 'private':
+            return
+        await message.answer(GUIDE, disable_web_page_preview=True)
 
     @dp.message(Command('offer'))
     async def create(message: Message, command: CommandObject, bot: Bot):
@@ -431,23 +539,24 @@ def setup(store):
             await message.answer('Сначала задайте @username в настройках Telegram.')
             return
         try:
-            target, url, amount, currency = parse_offer(command.args)
+            target, url, amount, currency, lang = parse_offer(command.args)
             if target and target == user.username.lower():
                 raise ValueError('Укажите другого пользователя.')
         except ValueError as exc:
             await message.answer(escape(str(exc)))
             return
-        key = store.create(user.id, user.username, target, url, amount, currency=currency)
+        key = store.create(user.id, user.username, target, url, amount, currency=currency, lang=lang)
         me = await bot.get_me()
         link = f'https://t.me/{me.username}?start={key}'
         cur_name = 'Stars' if currency == 'XTR' else 'TON'
+        lang_note = ' · English card' if lang == 'en' else ''
         if target:
-            share_text = f'Предложение для @{target}: {amount} {cur_name} за подарок. Оплата после передачи.'
+            share_text = f'Предложение для @{target}: {amount} {cur_name} за подарок. Оплата после передачи.{lang_note}'
             created_msg = (f'Офер для @{target} создан. Вы — автор офера. Получатель подарка — вы (@{user.username}).\n'
                            f'Отправьте адресату ссылку:\n{link}\n\n'
                            'Ссылка предназначена только указанному адресату. Не меняйте свой @username до завершения сделки.')
         else:
-            share_text = f'Предложение: {amount} {cur_name} за подарок. Оплата после передачи.'
+            share_text = f'Предложение: {amount} {cur_name} за подарок. Оплата после передачи.{lang_note}'
             created_msg = (f'Офер создан (без указания адресата). Вы — автор офера. Получатель подарка — вы (@{user.username}).\n'
                            f'Отправьте ссылку любому продавцу:\n{link}\n\n'
                            'Первый, кто откроет ссылку и нажмёт «Принять», станет продавцом по этой сделке.')
@@ -477,24 +586,34 @@ def setup(store):
         lines = [f'<code>{eid}</code>' for eid in ids]
         await message.answer(
             'Найдены custom_emoji_id:\n\n' + '\n'.join(lines) +
-            '\n\nСкопируй нужный ID и пришли мне — я зашью его в кнопку Принять или Отклонить.')
+            '\n\nСкопируй нужный ID и зашей его в кнопку Принять или Отклонить.')
+
+    @dp.callback_query(F.data == 'show_help')
+    async def show_help_cb(query: CallbackQuery):
+        if not isinstance(query.message, Message) or query.message.chat.type != 'private':
+            await query.answer('Откройте бота в личном чате.', show_alert=True)
+            return
+        await query.answer()
+        await query.message.answer(GUIDE, disable_web_page_preview=True)
 
     @dp.callback_query(F.data.contains(':'))
     async def callback(query: CallbackQuery, bot: Bot):
         action, key = query.data.split(':', 1)
         offer = store.get(key)
         is_inline = bool(query.inline_message_id)
+        lang = offer_lang(offer)
+        t = T[lang]
         if not is_inline and (not isinstance(query.message, Message) or query.message.chat.type != 'private'):
-            await query.answer('Откройте предложение в личном чате с ботом.', show_alert=True)
+            await query.answer(t['alert_private_only'], show_alert=True)
             return
         if not store.allowed(offer, query.from_user.id, query.from_user.username):
-            await query.answer(access_error(offer, query.from_user), show_alert=True)
+            await query.answer(access_error(offer, query.from_user, lang), show_alert=True)
             return
         business_id = query.message.business_connection_id if isinstance(query.message, Message) else None
         if business_id:
             connection = await bot.get_business_connection(business_id)
             if not connection.is_enabled or connection.user.id != offer['buyer']:
-                await query.answer('Бизнес-подключение недоступно.', show_alert=True)
+                await query.answer(t['alert_biz_unavailable'], show_alert=True)
                 return
         async def display(text, keyboard):
             if business_id:
@@ -518,7 +637,6 @@ def setup(store):
                 except TelegramBadRequest as exc:
                     error = str(exc).lower()
                     if 'there is no text in the message to edit' in error:
-                        # Previously sent GIF offers remain operable.
                         await bot.edit_message_caption(inline_message_id=query.inline_message_id,
                                                        caption=text, parse_mode='HTML', reply_markup=keyboard)
                     elif 'message is not modified' not in error:
@@ -531,16 +649,16 @@ def setup(store):
 
         if action in {'transfer', 'help'}:
             if offer['state'] != 'accepted':
-                await query.answer('Сначала примите предложение или откройте его актуальную карточку.', show_alert=True)
+                await query.answer(t['alert_not_accepted'], show_alert=True)
                 return
             await query.answer()
             await display(*render(offer))
             return
         if action == 'paid' and offer['state'] == 'pending':
             await query.answer()
-            await display('Подтвердите, только если вы действительно получили оплату.',
-                Keyboard(inline_keyboard=[[Button(text='Да, оплата получена', callback_data=f'confirm_paid:{key}')],
-                                         [Button(text='Назад', callback_data=f'view:{key}')]]))
+            await display(t['alert_confirm_paid'],
+                Keyboard(inline_keyboard=[[Button(text=t['btn_confirm_yes'], callback_data=f'confirm_paid:{key}')],
+                                         [Button(text=t['btn_back'], callback_data=f'view:{key}')]]))
             return
         if action == 'view':
             await query.answer()
@@ -549,13 +667,12 @@ def setup(store):
         if action == 'confirm_paid':
             action = 'paid'
         if not store.transition(key, query.from_user.id, query.from_user.username, action):
-            await query.answer('Статус уже изменился. Откройте предложение по исходной ссылке.', show_alert=True)
+            await query.answer(t['alert_status_changed'], show_alert=True)
             return
         if action == 'accept':
             name, number = gift_info(offer)
             await query.answer(
-                f'🎁 {name} #{number} успешно продαн!\n\n'
-                f'Передαйте подαрок покупαтелю для зαчисления {price(offer)}.',
+                t['alert_accept'].format(name=name, number=number, price=price(offer)),
                 show_alert=True)
         else:
             await query.answer()
@@ -578,8 +695,11 @@ def setup(store):
             'или без @продавца (офер уходит в текущий чат):\n'
             '<code>https://t.me/nft/PlushPepe-2687 20</code>\n\n'
             'В конце можно добавить <code>stars</code> или <code>gram</code> (по умолчанию stars).\n'
+            'Добавьте <code>eng</code> для карточки на английском.\n'
             'Получатель подарка — автор офера.',
-            reply_markup=Keyboard(inline_keyboard=[[Button(text='Создать офер inline', switch_inline_query='')]]))
+            reply_markup=Keyboard(inline_keyboard=[
+                [Button(text='Создать офер inline', switch_inline_query='')],
+                [Button(text='📖 Инструкция', callback_data='show_help')]]))
 
     return dp
 
@@ -635,14 +755,11 @@ async def update_timers(bot, store):
 
 
 async def main():
-    # Загружаем переменные из .env, перекрывая уже заданные в окружении.
-    load_dotenv(ROOT / '.env', override=True)
-    token = os.getenv('GIFT_OFFER_BOT_TOKEN')
-    if not token:
+    token = BOT_TOKEN.strip()
+    if not token or 'ВСТАВЬ' in token:
         raise SystemExit(
-            'Не найден GIFT_OFFER_BOT_TOKEN. Создайте файл .env рядом с main.py со строкой:\n'
-            '    GIFT_OFFER_BOT_TOKEN=123456789:AA...ваш_токен\n'
-            'Либо задайте переменную окружения GIFT_OFFER_BOT_TOKEN перед запуском.'
+            'Токен бота не задан. Откройте main.py и впишите свой токен от @BotFather '
+            'в переменную BOT_TOKEN в верхней части файла.'
         )
     store = Store(ROOT / 'offers.sqlite3')
     async with Bot(token, default=DefaultBotProperties(parse_mode='HTML')) as bot:
